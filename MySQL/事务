@@ -1,0 +1,394 @@
+[TOC]
+
+# 事务
+
+## 一、事务及其特性
+
+### 1、事务概念
+
+> 满足**ACID四大特性**的一条或多条SQL语句称为事务(Transaction)。
+
+在MySQL中，只有*InnoDB*和*NDB*两种存储引擎支持事务的功能。
+
+### 2、事务的四大特性：ACID
+
+- **原子性*(Atomicity)***
+
+一件事情，要么没有做，要么做了且已经做完，**不存在做了一半的中间状态**，这种特性称为原子性。
+
+- **隔离性*(Isolation)***
+
+事务A和事务B可能由多个执行步骤组成，但是**即使这些步骤交错执行，事务之间也不会相互影响**，这种特性称为隔离性。
+
+- **一致性*(Consistency)***
+
+满足现实世界中的**各种约束**的特性称为一致性，这种约束可能是一种**常识**，比如：身份证号有18位。也可能是一种**业务需求**，比如让数据库中的x和y永远保持相等。
+
+- **持久性*(Durability)***
+
+一个事务结束以后，它产生的**结果将被永久保留下来**，这种特性称为持久性。
+
+ 
+
+## 二、事务操作
+
+### 1、开启事务
+
+`BEGIN [WORK]`
+
+或
+
+`START TRANSACTION` 
+
+二者唯一的不同在于`start transaction`可以在后面跟一些修饰符：
+
+1. `READ ONLY`：只读事务。该事务包含的SQL语句只能读取数据，不能修改数据。(但是在本次事务中`CREATE TEMPORARY TABLE`创建的临时表是可以进行增删查改的)
+
+2. `READ WRITE`：读写事务。该事务包含的SQL语句可以进行增删查改(默认修饰符)。
+
+3. `WITH CONSISTENT SNAPSHOT`：启动一致性读(快照读)。
+
+修饰符可以搭配使用，比如：
+
+`START TRANSACTION READ ONLY, WITH CONSISTENT SNAPSHOT`
+
+但是`READ ONLY`和`READ WRITE`不得同时使用。
+
+### 2、提交事务
+
+`COMMIT [WORK]`
+
+当前事务的所有SQL语句写完了，则可以使用`commit`提交该事务。
+
+#### I. 自动提交
+
+MySQL系统变量`autocommit`默认值为1(ON)，表示自动提交事务，即：除非显式的使用`begin/start transaction`开启事务，否则**每一个SQL语句都会被视作一个独立的事务**。
+
+![img](https://typora-1307604235.cos.ap-nanjing.myqcloud.com/typora_img/202208121548971.jpg) 
+
+可以使用SET `autocommit` = 0或OFF将自动提交关闭。
+
+此时如果不手动开启一个事务，那么直到第一个`commit`或者`rollback`之前的所有SQL语句都属于同一个事务。
+
+#### II. 隐式提交
+
+当`autocommit`为OFF或者使用`begin/start transaction`手动开启一个事务时，事务不会自动提交。
+
+但是，如果事务包含以下SQL，则在这些SQL之前的所有SQL都会自动提交：
+
+- 使用数据定义语言(*DDL*)。
+
+
+包括`CREATE、ALTER、DROP`等修改数据库、表等数据库对象的SQL语句。
+
+- 隐式地使用或修改mysql数据库中的表。
+
+
+包括`ALTER USER、DROP USER、SET PASSWORD、GRANT`等。
+
+> 注：名为mysql的数据库是MySQL用来保存用户信息等数据的。
+
+- 上一个事务还没提交或回滚，就又开启了新的事务时，此时自动提交上一事务。
+
+
+- 使用关于锁定的语句。
+
+
+包括`LOCK TABLES、UNLOCK TABLES`等
+
+### 3、终止事务(回滚)
+
+`ROLLBACK [WORK]`
+
+如果发现事务的前几条SQL语句写错了，则可以通过`rollback`将数据库**回滚到开启事务前的状态**。
+
+但是，如果SQL语句包含对非InnoDB和非NDB表(即不支持事务的存储引擎)的操作，则对这些表的操作不会进行回滚。
+
+![image-20220813154752215](https://typora-1307604235.cos.ap-nanjing.myqcloud.com/typora_img/202208131548347.png) 
+
+#### 自动回滚
+
+如果一个事务还没有提交时**客户端退出或崩溃**，则数据库会自动回滚到事务开启之前的状态。
+
+### 4、保存点
+
+`SAVEPOINT point_name`
+
+在事务中添加一个或多个保存点。如果发现之前的SQL有错误，则可以通过`ROLLBACK TO point_name`让数据库回滚到该保存点之前的状态。
+
+![image-20220813155259762](https://typora-1307604235.cos.ap-nanjing.myqcloud.com/typora_img/202208131552802.png)
+
+ 
+
+## 三、redo日志
+
+### 1、问题引入
+
+> InnoDB是以页为单位管理表数据的，那么一个事务中对表的增删查改本质就是访问并修改数据页的内容。由于数据页原先是存储在磁盘中的，因此访问之前需要将所需页载入内存，然后再适时将脏页面刷新到磁盘。
+>
+> 但是，如果在页面刷新到磁盘之前，MySQL**发生故障崩溃**，或是**系统掉电关机**，那么必然就会导致刚刚的所有操作全部失效。
+
+对此问题的**一个解决办法**是：在事务提交前，先将该事务产生的所有脏页面全部刷新到磁盘。
+
+但是**相应的问题**在于：
+
+1. 一个事务访问的数据如果是非连续的，那么可能会导致随机I/O，使得**脏页面的数量较多**，而同时将这么多脏页面刷新到磁盘，**<font color=red>效率太低</font>**。
+
+2. 事务中的一个SQL可能只会修改一张16KB页面中的几字节的内容，如果为此将整张页面刷新到磁盘，显然**<font color=red>太浪费</font>**了。
+
+为此，redo日志诞生了，简单来说，它的功能就是**<font color=red>在事务提交前，将本次事务对哪些页面进行修改记录下来，然后将redo日志刷新到磁盘。</font>**
+
+### 2、redo日志的通用结构
+
+![img](https://typora-1307604235.cos.ap-nanjing.myqcloud.com/typora_img/202208121548974.jpg) 
+
+- **space ID + page number**
+
+记录本次操作修改了哪个表空间的哪个页面。
+
+注：表空间，简单来说就是一张表对应的所有页面的集合，在文件系统中对应InnoDB表的.ibd文件。
+
+- **data**
+
+该条redo日志的具体内容，根据redo日志的类型，内容也可能不一样。
+
+- **type**
+
+该条redo日志的类型，包括但不仅有：
+
+1. *MLOG_WTIRE_STRING*：记录了在页面的某个偏移量处写入了一个字节序列；
+2. *MLOG_COMP_REC_INSERT*：插入了一条使用紧凑行格式的行记录(紧凑行即5.0版本后使用的一类行格式)；
+3. *MLOG_COMP_REC_DELETE*：删除了一条使用紧凑行格式的行记录；
+4. *MLOG_COMP_LIST_START_DELETE*：从某条记录开始删除了一系列行记录；
+
+### 3、redo日志的基本工作流程
+
+1. 服务器在启动时会申请一块内存空间作为*redo log buffer*，这段空间被分成若干连续的512字节的*redo log block*。
+
+2. 在事务进行时，对页的操作会产生各种类型的redo日志，它们被顺序写入到*block*中。
+3. 在遇到*redo log buffer*空间不足，或者事务提交等情况时，redo日志会被刷新到磁盘上的日志文件中。
+
+4. 如果数据库崩溃，则通过redo日志将没来得及刷盘的页面恢复。
+
+### 4、redo日志的优势
+
+1. 相比于事务提交时刷新16kb的脏页面，redo日志**<font color=red>占用的空间更小</font>**。
+
+2. redo日志是连续存储的，因此刷新时<font color=red>**I/O效率较高**</font>。
+
+ 
+
+## 四、undo日志
+
+> redo日志是为了在事务提交后避免因为页面没有及时刷新到磁盘而导致数据丢失，而undo日志是为了方便在事务执行过程中回滚至出错之前的状态。
+>
+> redo：避免丢失
+>
+> undo：方便回滚
+
+### 1、InnoDB行记录的隐藏列
+
+- ***trx_id***
+
+如果某个事务进行了增删改的操作，那么InnoDB就会为他分配一个唯一的**事务id**。
+
+- ***roll_pointer***
+
+**回滚指针**，指向本条记录对应的**undo日志的地址**。
+
+### 2、增删改对应的undo日志
+
+#### I. insert操作的undo日志
+
+![img](https://typora-1307604235.cos.ap-nanjing.myqcloud.com/typora_img/202208121548975.jpg) 
+
+> 注：**每个事务生成的undo日志编号都从0开始递增，直至提交**；
+
+------
+
+#### II. delete操作的undo日志
+
+![img](https://typora-1307604235.cos.ap-nanjing.myqcloud.com/typora_img/202208121548988.jpg) 
+
+在事务内对行记录进行删除时，分为两个步骤：
+
+1. 将行记录的deleted_flag标志位设置成1，表示该列已被删除。
+2. 将该行记录的trx_id和roll_pointer存储到undo日志中，然后将行记录的trx_id和roll_pointer分别修改成当前事务的id和本次undo日志的地址。
+3. 如果本次事务提交，则将该行记录从正常的记录链表中移除，然后添加至垃圾链表。
+
+------
+
+#### III. update操作的undo日志
+
+![img](https://typora-1307604235.cos.ap-nanjing.myqcloud.com/typora_img/202208121548622.jpg) 
+
+ 
+
+### 3、undo页面
+
+undo日志被存放在*FIL_PAGE_UNDO*类型的页面中，该页面又被分为两个大类：
+
+1、*TRX_UNDO_INSERT*：由insert语句产生的undo日志，在事务提交后可以直接删除；
+
+2、*TRX_UNDO_UPDATE*：除*TRX_UNDO_INSERT*以外，其它undo日志都属于该类型，在事务提交后还要为MVCC服务，所以不能立即删除。
+
+每个事务都会维护INSERT和UPDATE两种类型的undo页面链表。
+
+ 
+
+## 五、事务隔离性
+
+### 1、事务并发带来的问题
+
+一个事务可能包含一个或多个SQL语句，当有多个事务到来时，服务器执行SQL的线程将会并发地执行，但是这样的并发往往会相互干渉，从而引发一致性、持久性和原子性的相关问题，包括：
+
+- 脏写*(dirty write)*
+
+
+一个事务**修改**了另一个还未提交的事务修改过的数据。
+
+- 脏读*(dirty read)*
+
+
+一个事务**读取**了另一个还未提交的事务修改过的数据。
+
+- 幻读*(phantom)*
+
+
+事务A读取了符合条件P的记录，在A未提交时事务B又插入了符合条件P的记录，那么此时事务A再读取符合条件P的数据时就会发现记录条数增加了。
+
+- 不可重复读*(non-repeatable read)*
+
+
+事务T1读取了一些记录，在未提交时事务T2修改了这些记录中的一部分，那么此时事务T1再读取这些记录时就会发现**和上次的记录不一样**。
+
+### 2、隔离级别
+
+为了解决事务并发带来的问题，MySQL引入了4种隔离级别，分别是：
+
+1. 读未提交*(Read Uncommitted)*
+
+最低等级的隔离级别，能够读取其它事务还未提交的数据，**几乎不加锁**，因此上述几种问题都可能出现。
+
+2. 读提交*(Read Committed)*
+
+**只能够读取其它事务已提交的数据**，但是如果事务B在事务A前提交了，那么B提交的数据可能会被A看到，从而导致幻读和不可重复读的问题。
+
+3. 可重复读*(Repeatable Read)*
+
+在读提交的基础上更上一层的隔离级别，A、B事务同时执行时，B事务对表中数据的**删改操作**即使在提交后也不会被A事务看见，从而避免了不可重复读的问题。但是B事务**insert**的新记录依然会被A看到，因此无法避免幻读问题。
+
+4. 可串行化*(Serializable)*
+
+最高等级的隔离级别，**对所有操作都会加锁**，因此避免了上述问题，但是效率过低。 
+
+|     隔离级别     |  脏读  | 不可重复读 |  幻读  |
+| :--------------: | :----: | :--------: | :----: |
+| READ UNCOMMITTED |  可能  |    可能    |  可能  |
+|  READ COMMITTED  | 不可能 |    可能    |  可能  |
+| REPEATABLE READ  | 不可能 |   不可能   |  可能  |
+|   SERIALIZABLE   | 不可能 |   不可能   | 不可能 |
+
+注：脏写是最严重的问题，无论哪种隔离级别都不允许脏写的情况发生。在一个事务修改某条记录前，会给该记录加锁，只有在事务提交后锁才会释放，此时其它事务才能继续修改该记录。
+
+### 3、设置隔离级别
+
+`SET [GLOBAL|SESSION] TRANSACTION ISOLATION LEVEL level`
+
+其中level的四个可选值为`REPEATABLE READ(默认)、READ COMMITTED、READ UNCOMMITTED、SERIALIZABLE`。
+
+- 如果使用*GLOBAL*关键字，则该隔离级别**在当前会话和后续所有新会话中生效**。
+
+- 如果使用*SESSION*关键字，则该隔离级别**仅在当前会话生效**。
+
+- 如果两个关键字都不设置，则该隔离级别**仅在下一个事务中生效**。
+
+
+### 4、查看隔离级别
+
+`SHOW VARIABLES LIKE 'tx_isolation'`
+
+或
+
+`SELECT @@tx_isolation`
+
+> 注：5.7.20版本后可以将tx替换成transaction
+>
+
+ 
+
+## 六、MVCC原理
+
+> MVCC，即多版本并发控制(Multi-Version Concurrency Control)，是访问记录版本链的过程。
+>
+
+### 1、版本链
+
+除了INSERT类型的undo日志没有roll_pointer指针(因为新插入的数据不存在历史版本)，其它日志都存在一个roll_pointer指针指向上一个操作该行记录的undo日志的起始地址。
+
+随着行记录更新的次数增多，这些undo日志最终会形成一个链表，该链表被称为**版本链**，其中靠近头结点的是最近的undo日志。
+
+![img](https://typora-1307604235.cos.ap-nanjing.myqcloud.com/typora_img/202208121548678.jpg) 
+
+### 2、ReadView
+
+#### I. 一致性视图与一致性读
+
+对于不同隔离级别的事务，它们读取行记录的方式和读到的版本是不同的，比如：
+
+- `READ UNCOMMITTED`级别的事务读取的记录必然是**版本链中最新的那一条**，即头结点。
+- `SERIALIZABLE`级别的事务**使用加锁的方式访问记录**。
+- `READ COMMITTED和REPEATABLE READ`级别的事务需要保证自己读到的是版本链中**已经提交的最新版本**。
+
+针对`READ COMMITTED和REPEATABLE READ`，判断版本的可见性尤为重要。因此，MySQL提出了**“一致性视图(ReadView)”**的概念。利用一致性视图进行读取的操作称为**<font color=red>“一致性读”</font>**。
+
+> 注：版本可见性指的是当前事务能否读取该版本的内容。
+
+#### II. 一致性视图的内容
+
+ReadView有4个重要内容：
+
+- `m_ids`：在生成ReadView时，系统中活跃的事务id列表。
+
+- `min_trx_id`：m_ids中的最小值。
+
+- `max_trx_id`：在生成ReadView时，系统应该分配给下一个新事务的id。
+
+- `creator_trx_id`：生成该ReadView的事务id。
+
+有了ReadView以后，事务应当读取哪一版本的记录就可以通过以下步骤判断：
+
+1. 如果对应版本的==trx_id等于ReadView的creator_trx_id==，则说明事务正在访问自己修改过的记录，因此可见。
+
+2. 如果对应版本的==trx_id小于ReadView的min_trx_id==，则说明在事务的ReadView生成时，该版本已经提交了，因此可见。
+
+3. 如果对应版本的==trx_id大于等于ReadView的max_trx_id==，则说明在事务的ReadView生成后，该版本才产生，因此不可见(与前人看不到后人做了哪些事一个道理)。
+
+4. 如果对应版本的==trx_id在ReadView的min_trx_id和max_trx_id之间==，则需要判断它是否在m_ids列表中：如果在，则说明在创建ReadView时，生成该版本的事务还是**活跃的，因此不可见**；如果不在，则说明在创建ReadView时，生成该版本的事务**已经提交了，因此可见**。
+
+> 总之：只有在ReadView生成之前提交的事务所做的修改和事务自身所做的修改是可见的。
+>
+> - 如果某个版本对当前事务不可见，就顺着版本链判断下一个版本的可见性。
+> - 如果所有版本都不可见，则最终的查询结果就不包含该条记录。
+
+#### III. 一致性视图的生成时机
+
+<font color=red>**ReadView生成时机的不同是READ COMMITTED和REPEATABLE READ最本质的区别。**</font>
+
+- *READ COMMITTED*<font color=red>**在每次读取数据前都会生成一个ReadView**</font>，在事务执行期间，别的事务提交的数据对于本事务是可见的，因此会有不可重复读和幻读的问题。
+- *REPEATABLE READ*<font color=red>**只在第一次读取数据时生成ReadView**</font>，在事务执行期间，别的事务提交的数据对于本事务是不可见的，因此也就不会有不可重复读的问题，同时也很大程度上解决了幻读问题，但是无法根治，比如：
+
+![img](https://typora-1307604235.cos.ap-nanjing.myqcloud.com/typora_img/202208121548695.jpg) 
+
+数字为语句执行的顺序。
+
+事务A插入数据并提交后，事务B看不到A插入的数据。但是，在事务B进行update操作后，**如果A插入的数据<font color=red>满足update的条件</font>，那么B此时再查看就会看到被修改后的A插入的数据**。
+
+>  注：之所以执行update之后就能看到，是因为更新后数据的trx_id会变成当前事务的id，满足MVCC中可见性的判断。
+>
+
+ 
+
+ 
+
+ 
